@@ -1,0 +1,111 @@
+name: Deploy Test Stand
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  test:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+    - name: Test the image
+      run: |
+        docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest python -c "import flask; print('Flask OK')"
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Deploy via SSH
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          # Создаём директорию для деплоя
+          mkdir -p /opt/test-stand
+          cd /opt/test-stand
+          
+          # Создаём docker-compose.yml для продакшена
+          cat > docker-compose.yml << 'DOCKEREOF'
+          services:
+            db:
+              image: postgres:15-alpine
+              environment:
+                POSTGRES_DB: ${DB_NAME}
+                POSTGRES_USER: ${DB_USER}
+                POSTGRES_PASSWORD: ${DB_PASSWORD}
+              volumes:
+                - postgres_data:/var/lib/postgresql/data
+              restart: unless-stopped
+            web:
+              image: ghcr.io/${{ github.repository }}:latest
+              ports:
+                - "80:5000"
+              environment:
+                DB_HOST: db
+                DB_NAME: ${DB_NAME}
+                DB_USER: ${DB_USER}
+                DB_PASSWORD: ${DB_PASSWORD}
+                ENV: production
+              depends_on:
+                - db
+              restart: unless-stopped
+          volumes:
+            postgres_data:
+          DOCKEREOF
+          
+          # Логинимся в GitHub Container Registry
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+          # Скачиваем последний образ
+          docker pull ghcr.io/${{ github.repository }}:latest
+          
+          # Запускаем контейнеры
+          export DB_NAME=${{ secrets.DB_NAME }}
+          export DB_USER=${{ secrets.DB_USER }}
+          export DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          docker-compose down
+          docker-compose up -d
+          
+          # Очистка старых образов
+          docker system prune -f
